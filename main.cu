@@ -9,7 +9,7 @@ inline auto f(const double x, const double sigma) -> double {
 }
 
 auto comp_kernel(const size_t R) -> std::vector<double> {
-    const size_t sigma = R / 3;
+    const double sigma = double(R) / 3;
 
     std::vector<double> kernel(R + 1);
     double sum = 0;
@@ -45,41 +45,66 @@ auto load_img(const std::string &filename) -> std::vector<uchar4> {
 texture<uchar4, 2> tex_in;
 texture<uchar4, 2> tex_out;
 
-__global__ void gauss_blur(int height, 
-                           int width, 
+__device__ void swap(int *x, int *y) {
+    int tmp = *x;
+    *x = *y;
+    *y = tmp;
+}
+
+__global__ void gauss_blur(int height,
+                           int width,
                            const double *const kernel,
                            const int R,
-                           double *const out,
+                           uchar4 *const out,
                            bool horizontal) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
     // change direction
     if (horizontal) {
-        int tmp = height;
-        height = width;
-        width = tmp;
+        swap(&height, &width);
     }
 
     while (tid < width) {
         // build initial window
-        uchar4 cur_scale = make_uchar4(0, 0, 0, 0);
+        uchar4 cur_sum = make_uchar4(0, 0, 0, 0);
         for (int i = -R; i <= R; ++i) {
+            // prepare texture coordinates
+            int tex_x = tid;
+            int tex_y = i;
             if (horizontal) {
-                uchar4 tex = tex2D(tex_out, i, tid);
-                cur_scale.x += kernel[abs(R)] * tex.x;
-                cur_scale.y += kernel[abs(R)] * tex.y;
-                cur_scale.z += kernel[abs(R)] * tex.z;
-            } else {
-                uchar4 tex = tex2D(tex_in, tid, i);
-                cur_scale.x += kernel[abs(R)] * tex.x;
-                cur_scale.y += kernel[abs(R)] * tex.y;
-                cur_scale.z += kernel[abs(R)] * tex.z;
+                swap(&tex_x, &tex_y);
             }
+
+            uchar4 tex = tex2D(horizontal ? tex_out : tex_in, tex_x, tex_y);
+            cur_sum.x += kernel[abs(R)] * tex.x;
+            cur_sum.y += kernel[abs(R)] * tex.y;
+            cur_sum.z += kernel[abs(R)] * tex.z;
         }
 
         // iterate over column/row with sliding window
         for (int i = 0; i < height; ++i) {
-            
+            int offset = horizontal ? tid * width+ i : i * height + tid;
+            out[offset].x = cur_sum.x;
+            out[offset].y = cur_sum.y;
+            out[offset].z = cur_sum.z;
+
+            // prepare coordinates for both ends of the window
+            int tex_last_x = tid;
+            int tex_last_y = i - R;
+            int tex_new_x = tid;
+            int tex_new_y = i + R;
+
+            if (horizontal) {
+                swap(&tex_last_x, &tex_last_y);
+                swap(&tex_new_x, &tex_new_y);
+            }
+
+            uchar4 tex_last = tex2D(horizontal ? tex_out : tex_in, tex_last_x, tex_last_y);
+            uchar4 tex_new = tex2D(horizontal ? tex_out : tex_in, tex_new_x, tex_new_y);
+
+            cur_sum.x += tex_new.x - tex_last.x;
+            cur_sum.y += tex_new.y - tex_last.y;
+            cur_sum.z += tex_new.z - tex_last.z;
         }
 
         tid += blockDim.x * gridDim.x;
