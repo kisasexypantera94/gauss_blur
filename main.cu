@@ -22,24 +22,43 @@ auto comp_kernel(const size_t R) -> std::vector<double> {
     return kernel;
 }
 
-auto load_img(const std::string &filename) -> std::vector<uchar4> {
+struct Image {
+    std::vector<uchar4> img;
     int height;
     int width;
-    std::vector<uchar4> img;
 
-    {
-        std::ifstream ifs(filename, std::ios::binary | std::ios::in);
-        if (!ifs.is_open()) {
+    Image() = default;
+    void load(const std::string &filename) {
+        {
+            std::ifstream ifs(filename, std::ios::binary | std::ios::in);
+            if (!ifs.is_open()) {
+                std::throw_with_nested(std::runtime_error("could not open file " + filename));
+            }
+
+            ifs.read(reinterpret_cast<char *>(&width), sizeof(int));
+            ifs.read(reinterpret_cast<char *>(&height), sizeof(int));
+            img.resize(height * width);
+            ifs.read(reinterpret_cast<char *>(img.data()), height * width * sizeof(uchar4));
+        }
+    }
+
+    void save(const std::string &filename) {
+        std::ofstream ofs(filename, std::ios::binary | std::ios::out);
+        if (!ofs.is_open()) {
             std::throw_with_nested(std::runtime_error("could not open file " + filename));
         }
 
-        ifs.read(reinterpret_cast<char *>(&height), sizeof(int));
-        ifs.read(reinterpret_cast<char *>(&width), sizeof(int));
-        img.resize(height * width);
-        ifs.read(reinterpret_cast<char *>(img.data()), height * width * sizeof(uchar4));
+        ofs.write(reinterpret_cast<const char *>(&width), sizeof(int));
+        ofs.write(reinterpret_cast<const char *>(&height), sizeof(int));
+        ofs.write(reinterpret_cast<const char *>(img.data()), height * width * sizeof(uchar4));
     }
+};
 
-    return img;
+inline void CHECK_ERR(cudaError_t err) {
+    if (err != cudaSuccess) {
+        printf("ERROR: %s\n", cudaGetErrorString(err));
+        exit(0);
+    }
 }
 
 texture<uchar4, 2> tex_in;
@@ -57,57 +76,23 @@ __global__ void gauss_blur(int height,
                            const int R,
                            uchar4 *const out,
                            bool horizontal) {
-    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    for (int x = threadIdx.x + blockDim.x * blockIdx.x; x < width; x += blockDim.x * gridDim.x) {
+        for (int y = threadIdx.y + blockDim.y * blockIdx.y; y < height; y += blockDim.y * gridDim.y) {
+            uchar4 weighted_sum = make_uchar4(0, 0, 0, 255);
+            for (int r = -R; r <= R; ++r) {
+                int tex_x = x + (horizontal ? r : 0);
+                int tex_y = y + (horizontal ? 0 : r);
 
-    // change direction
-    if (horizontal) {
-        swap(&height, &width);
-    }
-
-    while (tid < width) {
-        // build initial window
-        uchar4 cur_sum = make_uchar4(0, 0, 0, 0);
-        for (int i = -R; i <= R; ++i) {
-            // prepare texture coordinates
-            int tex_x = tid;
-            int tex_y = i;
-            if (horizontal) {
-                swap(&tex_x, &tex_y);
+                const uchar4 tex = tex2D(horizontal ? tex_out : tex_in, tex_x, tex_y);
+                const double scale = kernel[abs(r)];
+                weighted_sum.x += scale * tex.x;
+                weighted_sum.y += scale * tex.y;
+                weighted_sum.z += scale * tex.z;
             }
 
-            uchar4 tex = tex2D(horizontal ? tex_out : tex_in, tex_x, tex_y);
-            cur_sum.x += kernel[abs(R)] * tex.x;
-            cur_sum.y += kernel[abs(R)] * tex.y;
-            cur_sum.z += kernel[abs(R)] * tex.z;
+            const int offset = width * y + x;
+            out[offset] = weighted_sum;
         }
-
-        // iterate over column/row with sliding window
-        for (int i = 0; i < height; ++i) {
-            int offset = horizontal ? tid * width+ i : i * height + tid;
-            out[offset].x = cur_sum.x;
-            out[offset].y = cur_sum.y;
-            out[offset].z = cur_sum.z;
-
-            // prepare coordinates for both ends of the window
-            int tex_last_x = tid;
-            int tex_last_y = i - R;
-            int tex_new_x = tid;
-            int tex_new_y = i + R;
-
-            if (horizontal) {
-                swap(&tex_last_x, &tex_last_y);
-                swap(&tex_new_x, &tex_new_y);
-            }
-
-            uchar4 tex_last = tex2D(horizontal ? tex_out : tex_in, tex_last_x, tex_last_y);
-            uchar4 tex_new = tex2D(horizontal ? tex_out : tex_in, tex_new_x, tex_new_y);
-
-            cur_sum.x += tex_new.x - tex_last.x;
-            cur_sum.y += tex_new.y - tex_last.y;
-            cur_sum.z += tex_new.z - tex_last.z;
-        }
-
-        tid += blockDim.x * gridDim.x;
     }
 }
 
@@ -120,30 +105,74 @@ int main() {
     std::cin >> out;
     std::cin >> R;
 
-    std::vector<uchar4> h_in;
+    // Prepare images
+    Image h_in;
+    Image h_out;
+
     try {
-        h_in = load_img(in);
+        h_in.load(in);
     } catch (const std::exception &e) {
         std::cerr << "ERROR: " + std::string(e.what()) << std::endl;
         return 1;
     }
 
+    // Prepare filter
     auto kernel = comp_kernel(R);
     for (const auto x : kernel) {
         std::cout << x << " ";
     }
     std::cout << std::endl;
 
-    uchar4 *d_in;
+    // Prepare device buffers
     uchar4 *d_out;
-    cudaMalloc(&d_in, h_in.size() * sizeof(uchar4));
-    cudaMalloc(&d_out, h_in.size() * sizeof(uchar4));
+    double *d_kernel;
+    CHECK_ERR(cudaMalloc(&d_out, h_in.img.size() * sizeof(uchar4)));
+    CHECK_ERR(cudaMalloc(&d_kernel, kernel.size() * sizeof(double)));
 
-    cudaBindTexture(NULL, tex_in, d_in, h_in.size() * sizeof(uchar4));
-    cudaBindTexture(NULL, tex_out, d_out, h_in.size() * sizeof(uchar4));
+    CHECK_ERR(cudaMemcpy(d_kernel, kernel.data(), kernel.size() * sizeof(double), cudaMemcpyHostToDevice));
 
+    // Bind textures to device buffers
+    cudaArray *arr_in;
+    cudaArray *arr_out;
+    cudaChannelFormatDesc desc = cudaCreateChannelDesc<uchar4>();
+    CHECK_ERR(cudaMallocArray(&arr_in, &desc, h_in.width, h_in.height));
+    CHECK_ERR(cudaMallocArray(&arr_out, &desc, h_in.width, h_in.height));
+    CHECK_ERR(cudaMemcpyToArray(arr_in, 0, 0, h_in.img.data(), h_in.img.size() * sizeof(uchar4), cudaMemcpyHostToDevice));
 
-    cudaMemcpy(&d_in, &h_in, h_in.size() * sizeof(uchar4), cudaMemcpyHostToDevice);
+    tex_in.addressMode[0] = cudaAddressModeClamp;
+    tex_in.addressMode[1] = cudaAddressModeClamp;
+    tex_in.channelDesc = desc;
+    tex_in.filterMode = cudaFilterModePoint;
+    tex_in.normalized = false;
 
-    cudaFree(d_in);
+    CHECK_ERR(cudaBindTextureToArray(tex_in, arr_in, desc));
+    CHECK_ERR(cudaBindTextureToArray(tex_out, arr_out, desc));
+
+    // Run kernel
+    auto block_dim = dim3(32, 32);
+    auto grid_dim = dim3(32, 32);
+    gauss_blur<<<grid_dim, block_dim>>>(h_in.height, h_in.width, d_kernel, R, d_out, false);
+    CHECK_ERR(cudaDeviceSynchronize());
+    CHECK_ERR(cudaGetLastError());
+
+    CHECK_ERR(cudaMemcpyToArray(arr_out, 0, 0, d_out, h_in.img.size() * sizeof(uchar4), cudaMemcpyDeviceToDevice));
+    gauss_blur<<<grid_dim, block_dim>>>(h_in.height, h_in.width, d_kernel, R, d_out, true);
+    CHECK_ERR(cudaDeviceSynchronize());
+    CHECK_ERR(cudaGetLastError());
+
+    // Get results
+    h_out.img.resize(h_in.img.size());
+    h_out.height = h_in.height;
+    h_out.width = h_in.width;
+    CHECK_ERR(cudaMemcpy(h_out.img.data(), d_out, h_in.img.size() * sizeof(uchar4), cudaMemcpyDeviceToHost));
+
+    h_out.save(out);
+
+    CHECK_ERR(cudaUnbindTexture(tex_in));
+    CHECK_ERR(cudaUnbindTexture(tex_out));
+
+    CHECK_ERR(cudaFreeArray(arr_in));
+    CHECK_ERR(cudaFreeArray(arr_out));
+    CHECK_ERR(cudaFree(d_out));
+    CHECK_ERR(cudaFree(d_kernel));
 }
