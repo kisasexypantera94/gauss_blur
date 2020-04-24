@@ -3,43 +3,39 @@
 #include <fstream>
 #include <vector>
 #include <exception>
+#include <stdexcept>
 
 // =========================================================================
 texture<uchar4, 2> tex_in;
 texture<uchar4, 2> tex_out;
 
-__device__ void swap(int *x, int *y) {
-    int tmp = *x;
-    *x = *y;
-    *y = tmp;
-}
-
 __global__ void gauss_blur(const int height,
                            const int width,
-                           const double *const filter,
+                           const double *const filter, // TODO: maybe constant memory?
                            const int R,
                            uchar4 *const out,
                            const bool horizontal) {
     for (int x = threadIdx.x + blockDim.x * blockIdx.x; x < width; x += blockDim.x * gridDim.x) {
         for (int y = threadIdx.y + blockDim.y * blockIdx.y; y < height; y += blockDim.y * gridDim.y) {
-            uchar4 weighted_sum = make_uchar4(0, 0, 0, 255);
+            double3 weighted_sum = make_double3(0, 0, 0);
             for (int r = -R; r <= R; ++r) {
                 const int tex_x = x + (horizontal ? r : 0);
                 const int tex_y = y + (horizontal ? 0 : r);
 
                 const uchar4 tex = tex2D(horizontal ? tex_out : tex_in, tex_x, tex_y);
                 const double scale = filter[abs(r)];
-                weighted_sum.x += scale * tex.x;
-                weighted_sum.y += scale * tex.y;
-                weighted_sum.z += scale * tex.z;
+                weighted_sum.x += scale * double(tex.x);
+                weighted_sum.y += scale * double(tex.y);
+                weighted_sum.z += scale * double(tex.z);
             }
 
-            out[width * y + x] = weighted_sum;
+            out[width * y + x] = make_uchar4(weighted_sum.x, weighted_sum.y, weighted_sum.z, 0);
         }
     }
 }
-
 // =========================================================================
+
+
 inline auto f(const double x, const double sigma) -> double {
     return 1 / sqrt(2 * M_PI * sigma*sigma) * exp(-x*x / (2 * sigma*sigma));
 }
@@ -62,19 +58,16 @@ struct Image : std::vector<uchar4> {
     int height;
     int width;
 
-    Image() = default;
     void load(const std::string &filename) {
-        {
-            std::ifstream ifs(filename, std::ios::binary | std::ios::in);
-            if (!ifs.is_open()) {
-                std::throw_with_nested(std::runtime_error("could not open file " + filename));
-            }
-
-            ifs.read(reinterpret_cast<char *>(&width), sizeof(int));
-            ifs.read(reinterpret_cast<char *>(&height), sizeof(int));
-            this->resize(height * width);
-            ifs.read(reinterpret_cast<char *>(this->data()), height * width * sizeof(uchar4));
+        std::ifstream ifs(filename, std::ios::binary | std::ios::in);
+        if (!ifs.is_open()) {
+            std::throw_with_nested(std::runtime_error("could not open file " + filename));
         }
+
+        ifs.read(reinterpret_cast<char *>(&width), sizeof(int));
+        ifs.read(reinterpret_cast<char *>(&height), sizeof(int));
+        this->resize(height * width);
+        ifs.read(reinterpret_cast<char *>(this->data()), height * width * sizeof(uchar4));
     }
 
     void save(const std::string &filename) {
@@ -89,7 +82,7 @@ struct Image : std::vector<uchar4> {
     }
 };
 
-inline void CHECK_ERR(cudaError_t err) {
+inline void CHECK_ERR(const cudaError_t err) {
     if (err != cudaSuccess) {
         printf("ERROR: %s\n", cudaGetErrorString(err));
         exit(0);
@@ -170,5 +163,10 @@ int main() {
     }
 
     auto h_out = gauss_blur_image(h_in, R);
-    h_out.save(out);
+    try {
+        h_out.save(out);
+    } catch (const std::exception &e) {
+        std::cerr << "ERROR: " + std::string(e.what()) << std::endl;
+        return 1;
+    }
 }
