@@ -9,12 +9,13 @@
 texture<uchar4, 2> tex_in;
 texture<uchar4, 2> tex_out;
 
-__global__ void gauss_blur(const int height,
-                           const int width,
-                           const double *const filter, // TODO: maybe constant memory?
-                           const int R,
-                           uchar4 *const out,
-                           const bool horizontal) {
+__global__
+void gauss_blur(const int height,
+                const int width,
+                const double *const filter, // TODO: maybe constant memory?
+                const int R,
+                uchar4 *const out,
+                const bool horizontal) {
     for (int x = threadIdx.x + blockDim.x * blockIdx.x; x < width; x += blockDim.x * gridDim.x) {
         for (int y = threadIdx.y + blockDim.y * blockIdx.y; y < height; y += blockDim.y * gridDim.y) {
             double3 weighted_sum = make_double3(0, 0, 0);
@@ -37,19 +38,24 @@ __global__ void gauss_blur(const int height,
 
 
 inline auto f(const double x, const double sigma) -> double {
-    return 1 / sqrt(2 * M_PI * sigma*sigma) * exp(-x*x / (2 * sigma*sigma));
+    return 1.0 / sqrt(2.0 * M_PI * sigma*sigma) * exp(-x*x / (2.0 * sigma*sigma));
 }
 
 auto comp_filter(const size_t R) -> std::vector<double> {
-    const double sigma = R / 3.0;
+    const double sigma = R;
 
     std::vector<double> filter(R + 1);
     double sum = 0;
-    for (size_t t = 1; t <= R; ++t) {
+    for (size_t t = 0; t <= R; ++t) {
         filter[t] = f(t, sigma);
         sum += filter[t];
     }
-    filter[0] = 1.0 - 2 * sum;
+    sum -= filter[0];
+
+    for (size_t t = 0; t <= R; ++t) {
+        static double tmp = filter[0];
+        filter[t] /= (sum * 2 + tmp);
+    }
 
     return filter;
 }
@@ -114,8 +120,8 @@ auto gauss_blur_image(const Image &h_in, const size_t R) -> Image {
     CHECK_ERR(cudaBindTextureToArray(tex_out, arr_out, desc));
 
     // Run kernel
-    auto block_dim = dim3(32, 32);
-    auto grid_dim = dim3(32, 32);
+    auto block_dim = dim3(16, 16);
+    auto grid_dim = dim3(16, 16);
     // Vertical
     gauss_blur<<<grid_dim, block_dim>>>(h_in.height, h_in.width, d_filter, R, d_out, false);
     CHECK_ERR(cudaDeviceSynchronize());
@@ -160,6 +166,17 @@ int main() {
     } catch (const std::exception &e) {
         std::cerr << "ERROR: " + std::string(e.what()) << std::endl;
         return 1;
+    }
+
+    if (R == 0) {
+        try {
+            h_in.save(out);
+        } catch (const std::exception &e) {
+            std::cerr << "ERROR: " + std::string(e.what()) << std::endl;
+            return 1;
+        }
+
+        return 0;
     }
 
     auto h_out = gauss_blur_image(h_in, R);
